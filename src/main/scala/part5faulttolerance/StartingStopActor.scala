@@ -69,7 +69,7 @@ object StartingStopActor extends App {
 
   val abruptlyTerminatorActor = system.actorOf(Props[Child])
   abruptlyTerminatorActor ! "you are about to be terminated"
-  abruptlyTerminatorActor ! Kill
+  abruptlyTerminatorActor ! Kill      // makes the actor throw an ActorKilledException
   abruptlyTerminatorActor ! "you are terminated"
 
   /**
