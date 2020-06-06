@@ -1,8 +1,8 @@
 package part7patterns
 
-import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Cancellable, Props}
+import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Cancellable, FSM, Props}
 import akka.testkit.{ImplicitSender, TestKit}
-import org.scalatest.{BeforeAndAfterAll, WordSpecLike}
+import org.scalatest.{BeforeAndAfterAll, OneInstancePerTest, WordSpecLike}
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
@@ -10,7 +10,7 @@ import scala.language.postfixOps
 
 class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
   with ImplicitSender
-  with WordSpecLike with BeforeAndAfterAll {
+  with WordSpecLike with BeforeAndAfterAll with OneInstancePerTest {
 
   override def afterAll(): Unit = {
     TestKit.shutdownActorSystem(system)
@@ -18,22 +18,22 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
 
   import FSMSpec._
 
-  "a vending maching" should {
+  def runTestSuite(props: Props): Unit = {
     "error when not initialized" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! RequestProduct("coke")
       expectMsg(VendingError("MachineNotInitialized"))
     }
 
     "report a product not available" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 1))
       vendingMachine ! RequestProduct("sandwich")
       expectMsg(VendingError("ProductNotAvailable"))
     }
 
     "throw a timeout if I don't insert money" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 1))
 
       vendingMachine ! RequestProduct("coke")
@@ -45,7 +45,7 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
     }
 
     "handle the reception of partial money" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 3))
       vendingMachine ! RequestProduct("coke")
       expectMsg(Instruction("Please insert 3 dollars"))
@@ -60,7 +60,7 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
     }
 
     "deliver the product if I insert enough money" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 3))
       vendingMachine ! RequestProduct("coke")
       expectMsg(Instruction("Please insert 3 dollars"))
@@ -70,7 +70,7 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
     }
 
     "give back change and be able to request money for a new product" in {
-      val vendingMachine = system.actorOf(Props[VendingMachine])
+      val vendingMachine = system.actorOf(props)
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 3))
       vendingMachine ! RequestProduct("coke")
       expectMsg(Instruction("Please insert 3 dollars"))
@@ -82,6 +82,15 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
       vendingMachine ! RequestProduct("coke")
       expectMsg(Instruction("Please insert 3 dollars"))
     }
+  }
+
+  "a vending machine" should {
+    runTestSuite(Props[VendingMachine])
+  }
+
+  // VendingMachineFSM
+  "a vending maching FSM" should {
+    runTestSuite(Props[VendingMachineFSM])
   }
 }
 
@@ -158,5 +167,83 @@ object FSMSpec {
     def startReceiveMoneyTimeoutSchedule = context.system.scheduler.scheduleOnce(1 seconds) {
       self ! ReceiveMoneyTimeout
     }
+  }
+
+  // step 1 - define the states and the data of the actor
+  trait VendingState
+  case object Idle extends VendingState
+  case object Operational extends VendingState
+  case object WaitForMoney extends VendingState
+
+  trait VendingData
+  case object Unitialized extends VendingData
+  case class Initialized(inventory: Map[String, Int], prices: Map[String, Int]) extends VendingData
+  case class WaitForMoneyData(inventory: Map[String, Int], prices: Map[String, Int], product: String,
+                              money: Int, requester: ActorRef) extends VendingData
+
+  class VendingMachineFSM extends FSM[VendingState, VendingData] {
+    // we don't have a receive handler
+
+    // triggers and event when receives a message => EVENT(message, data)
+    startWith(Idle, Unitialized)
+
+    when(Idle) {
+      case Event(Initialize(inventory, prices), Unitialized) =>
+        goto(Operational) using Initialized(inventory, prices)
+      // equivalent to context.become(operational(..))
+      case _ =>
+        sender() ! VendingError("MachineNotInitialized")
+        stay()
+    }
+
+    when(Operational) {
+      case Event(RequestProduct(product), Initialized(inventory, prices)) =>
+        inventory.get(product) match {
+          case None | Some(0) =>
+            sender() ! VendingError("ProductNotAvailable")
+            stay()
+          case Some(_) =>
+            val price = prices(product)
+            sender() ! Instruction(s"Please insert $price dollars")
+            goto(WaitForMoney) using WaitForMoneyData(inventory, prices, product, 0, sender())
+        }
+    }
+
+    when(WaitForMoney, stateTimeout = 1 second) {
+      case Event(StateTimeout, WaitForMoneyData(inventory, prices, product, money, requester)) =>
+        requester ! VendingError("RequestTimeout")
+        if (money > 0) requester ! GiveBackChange(money)
+        goto(Operational) using Initialized(inventory, prices)
+      case Event(ReceiveMoney(amount), WaitForMoneyData(inventory, prices, product, money, requester)) =>
+        val price = prices(product)
+        if (money + amount >= price) {
+          // user buys product
+          requester ! Deliver(product)
+          // deliver the change
+          if (money + amount - price > 0) requester ! GiveBackChange(money + amount - price)
+          // updating the inventory
+          val newStock = inventory(product) - 1
+          val newInventory = inventory + (product -> newStock)
+
+          goto(Operational) using Initialized(newInventory, prices)
+        } else {
+          val remainingMoney = price - money - amount
+          requester ! Instruction(s"Please insert $remainingMoney dollars")
+
+          stay() using WaitForMoneyData(inventory, prices, product, money + amount, requester)
+        }
+    }
+
+    whenUnhandled {
+      case Event(_, _) =>
+        sender() ! VendingError("CommandNotFound")
+        stay()
+    }
+
+    onTransition {
+      case stateA -> stateB => log.info(s"Transitioning from $stateA to $stateB")
+    }
+
+    initialize()  // this method starts the actor actually
   }
 }
