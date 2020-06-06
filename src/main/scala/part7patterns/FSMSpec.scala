@@ -18,27 +18,28 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
 
   import FSMSpec._
 
-  "A vending machine" should {
+  "a vending maching" should {
     "error when not initialized" in {
       val vendingMachine = system.actorOf(Props[VendingMachine])
       vendingMachine ! RequestProduct("coke")
       expectMsg(VendingError("MachineNotInitialized"))
     }
 
-    "report a product not availabe" in {
+    "report a product not available" in {
       val vendingMachine = system.actorOf(Props[VendingMachine])
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 1))
       vendingMachine ! RequestProduct("sandwich")
       expectMsg(VendingError("ProductNotAvailable"))
     }
 
-    "throw timeout if I don't insert money" in {
+    "throw a timeout if I don't insert money" in {
       val vendingMachine = system.actorOf(Props[VendingMachine])
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 1))
+
       vendingMachine ! RequestProduct("coke")
       expectMsg(Instruction("Please insert 1 dollars"))
 
-      within (1.5 seconds) {
+      within(1.5 seconds) {
         expectMsg(VendingError("RequestTimeout"))
       }
     }
@@ -52,13 +53,13 @@ class FSMSpec extends TestKit(ActorSystem("FSMSpec"))
       vendingMachine ! ReceiveMoney(1)
       expectMsg(Instruction("Please insert 2 dollars"))
 
-      within (1.5 seconds) {
+      within(1.5 seconds) {
         expectMsg(VendingError("RequestTimeout"))
         expectMsg(GiveBackChange(1))
       }
     }
 
-    "deliver the product if I insert all the money" in {
+    "deliver the product if I insert enough money" in {
       val vendingMachine = system.actorOf(Props[VendingMachine])
       vendingMachine ! Initialize(Map("coke" -> 10), Map("coke" -> 3))
       vendingMachine ! RequestProduct("coke")
@@ -92,31 +93,35 @@ object FSMSpec {
   case class Initialize(inventory: Map[String, Int], prices: Map[String, Int])
   case class RequestProduct(product: String)
 
-  case class Instruction(instruction: String) // the message the VM will shown on its "screen"
+  case class Instruction(instruction: String)
   case class ReceiveMoney(amount: Int)
   case class Deliver(product: String)
   case class GiveBackChange(amount: Int)
 
   case class VendingError(reason: String)
   case object ReceiveMoneyTimeout
+
   class VendingMachine extends Actor with ActorLogging {
+
     implicit val executionContext: ExecutionContext = context.dispatcher
 
-    override def receive: Receive = idle
+    override def receive: Receive = idle()
 
-    def idle: Receive = {
+
+    def idle(): Receive = {
       case Initialize(inventory, prices) => context.become(operational(inventory, prices))
       case _ => sender() ! VendingError("MachineNotInitialized")
     }
 
+
     def operational(inventory: Map[String, Int], prices: Map[String, Int]): Receive = {
       case RequestProduct(product) => inventory.get(product) match {
-        case None | Some(0)=>
-          sender() ! VendingError("ProductNotAvailable")
+        case None | Some(0) => sender() ! VendingError("ProductNotAvailable")
         case Some(_) =>
-          val price = prices.get(product).get
+          val price = prices(product)
           sender() ! Instruction(s"Please insert $price dollars")
-          context.become(waitForMoney(inventory, prices, product, 0, startReceiveMoneyTimeoutSchedule , sender()))
+          context.become(waitForMoney(inventory, prices, product, 0, startReceiveMoneyTimeoutSchedule, sender()))
+
       }
     }
 
@@ -124,7 +129,7 @@ object FSMSpec {
                      prices: Map[String, Int],
                      product: String,
                      money: Int,
-                     moneyTimeoutSchedule: Cancellable,
+                     moneyTimeoutScheduler: Cancellable,
                      requester: ActorRef
                     ): Receive = {
       case ReceiveMoneyTimeout =>
@@ -132,28 +137,26 @@ object FSMSpec {
         if (money > 0) requester ! GiveBackChange(money)
         context.become(operational(inventory, prices))
       case ReceiveMoney(amount) =>
-        moneyTimeoutSchedule.cancel()
+        moneyTimeoutScheduler.cancel()
         val price = prices(product)
         if (money + amount >= price) {
           // user buys product
           requester ! Deliver(product)
-
-          // deliver change
+          // deliver the change
           if (money + amount - price > 0) requester ! GiveBackChange(money + amount - price)
-          // updating inventory
+          // updating the inventory
           val newStock = inventory(product) - 1
           val newInventory = inventory + (product -> newStock)
           context.become(operational(newInventory, prices))
         } else {
-          val remaningMoney = price - money - amount
-          requester ! Instruction(s"Please insert $remaningMoney dollars")
+          val remainingMoney = price - money - amount
+          requester ! Instruction(s"Please insert $remainingMoney dollars")
           context.become(waitForMoney(inventory, prices, product, money + amount, startReceiveMoneyTimeoutSchedule, requester))
         }
     }
 
-    def startReceiveMoneyTimeoutSchedule =
-      context.system.scheduler.scheduleOnce(1 second) {
-        self ! ReceiveMoneyTimeout
-      }
+    def startReceiveMoneyTimeoutSchedule = context.system.scheduler.scheduleOnce(1 seconds) {
+      self ! ReceiveMoneyTimeout
+    }
   }
 }
